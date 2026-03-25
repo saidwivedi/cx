@@ -538,6 +538,44 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func handleRefresh(w http.ResponseWriter, r *http.Request) {
+	subpath := strings.TrimPrefix(r.URL.Path, "/refresh/")
+	full, err := safePath(subpath)
+	if err != nil {
+		http.Error(w, "Forbidden", 403)
+		return
+	}
+
+	// Clear dirCache entries for this directory
+	dirCache.Range(func(key, _ interface{}) bool {
+		if strings.HasPrefix(key.(string), full+"|") {
+			dirCache.Delete(key)
+		}
+		return true
+	})
+
+	// Clear thumbnail cache for files in this directory
+	entries, _ := os.ReadDir(full)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(e.Name()))
+		if !imageExts[ext] {
+			continue
+		}
+		filePath := filepath.Join(full, e.Name())
+		if info, err := e.Info(); err == nil {
+			key := thumbCacheKey(filePath, info.ModTime().Unix())
+			thumbCache.Delete(key)
+			os.Remove(filepath.Join(cacheDir, key+".jpg"))
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
 func handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/" {
 		http.Redirect(w, r, "/browse/", http.StatusFound)
@@ -1331,6 +1369,7 @@ func runServer() {
 	mux.HandleFunc("/thumb/", handleThumb)
 	mux.HandleFunc("/raw/", handleRaw)
 	mux.HandleFunc("/api/", handleAPI)
+	mux.HandleFunc("/refresh/", handleRefresh)
 
 	hostname, _ := os.Hostname()
 	addr := fmt.Sprintf("%s:%d", *host, *port)
@@ -1827,6 +1866,9 @@ select.ctrl-select:focus{outline:none;border-color:var(--accent)}
     <a class="back-btn" href="/browse/" title="Go to root">
       <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8.354 1.146a.5.5 0 00-.708 0l-6.5 6.5a.5.5 0 00.146.854l.646.292V13.5A1.5 1.5 0 003.438 15h3.312V11h2.5v4h3.312a1.5 1.5 0 001.5-1.5V8.792l.646-.292a.5.5 0 00.146-.854l-6.5-6.5z"/></svg>
     </a>
+    <button class="back-btn" onclick="refreshDir()" title="Refresh cache for this directory">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M2.5 8a5.5 5.5 0 019.3-3.95M13.5 8a5.5 5.5 0 01-9.3 3.95"/><path d="M12 1v3.5h-3.5M4 15v-3.5h3.5" stroke-linejoin="round"/></svg>
+    </button>
     <nav class="breadcrumb" aria-label="Path">
       <a href="/browse/">root</a>
       {{range $i,$c := .Breadcrumbs}}
@@ -1959,6 +2001,15 @@ select.ctrl-select:focus{outline:none;border-color:var(--accent)}
 const images=[];
 let ci=0,lbMode='';
 const currentPath='{{js .CurrentPath}}'.replace(/^\/|\/$/g,'');
+
+// ── Refresh ─────────────────────────────────────────────────────────
+function refreshDir(){
+  var btn=event.currentTarget;
+  btn.style.opacity='0.5';btn.style.pointerEvents='none';
+  fetch('/refresh/'+currentPath).then(function(r){return r.json()}).then(function(){
+    window.location.reload();
+  });
+}
 
 // ── Lightbox ────────────────────────────────────────────────────────
 function openLightbox(i){
