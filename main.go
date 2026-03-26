@@ -261,7 +261,7 @@ func handleBrowse(w http.ResponseWriter, r *http.Request) {
 
 	sortBy := r.URL.Query().Get("sort")
 	if sortBy == "" {
-		sortBy = "name"
+		sortBy = "date"
 	}
 
 	// Build breadcrumbs
@@ -486,7 +486,7 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 
 	sortBy := r.URL.Query().Get("sort")
 	if sortBy == "" {
-		sortBy = "name"
+		sortBy = "date"
 	}
 	itemType := r.URL.Query().Get("type")
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
@@ -1898,7 +1898,7 @@ select.ctrl-select:focus{outline:none;border-color:var(--accent)}
     </div>
     <div class="ctrl-group">
       <span class="ctrl-label">Sort</span>
-      <select class="ctrl-select" id="sortBy" onchange="window.location.href='?sort='+this.value">
+      <select class="ctrl-select" id="sortBy" onchange="localStorage.setItem('cx-sort',this.value);window.location.href='?sort='+this.value">
         <option value="name"{{if eq .Sort "name"}} selected{{end}}>Name</option>
         <option value="date"{{if eq .Sort "date"}} selected{{end}}>Newest</option>
         <option value="size"{{if eq .Sort "size"}} selected{{end}}>Size</option>
@@ -1998,6 +1998,13 @@ select.ctrl-select:focus{outline:none;border-color:var(--accent)}
 </div>
 
 <script>
+(function(){
+  var u=new URL(window.location);
+  if(!u.searchParams.has('sort')){
+    var s=localStorage.getItem('cx-sort');
+    if(s){u.searchParams.set('sort',s);window.location.replace(u);return;}
+  }
+})();
 const images=[];
 let ci=0,lbMode='';
 const currentPath='{{js .CurrentPath}}'.replace(/^\/|\/$/g,'');
