@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/md5"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -29,7 +31,41 @@ var (
 	rootDir   string
 	thumbSize int
 	cacheDir  string
+	authToken string
 )
+
+func generateToken() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Check query param first — if valid, set cookie and redirect to clean URL
+		if tok := r.URL.Query().Get("token"); tok == authToken {
+			http.SetCookie(w, &http.Cookie{
+				Name:     "cx_token",
+				Value:    authToken,
+				Path:     "/",
+				HttpOnly: true,
+				SameSite: http.SameSiteStrictMode,
+			})
+			// Strip token from URL and redirect
+			q := r.URL.Query()
+			q.Del("token")
+			r.URL.RawQuery = q.Encode()
+			http.Redirect(w, r, r.URL.String(), http.StatusFound)
+			return
+		}
+		// Check cookie
+		if cookie, err := r.Cookie("cx_token"); err == nil && cookie.Value == authToken {
+			next.ServeHTTP(w, r)
+			return
+		}
+		http.Error(w, "Unauthorized. Open the link with ?token=... from 'cx start' output.", http.StatusUnauthorized)
+	})
+}
 
 // pixelReader provides fast direct pixel access, avoiding interface dispatch per pixel.
 type pixelReader struct {
@@ -888,6 +924,7 @@ func statePath() string {
 type State struct {
 	ClusterID string `json:"cluster_id"`
 	Host      string `json:"host"`
+	Token     string `json:"token,omitempty"`
 }
 
 // ANSI escape helpers
@@ -982,20 +1019,22 @@ func runConfig() {
 		defaultSched)
 
 	// Set directory defaults based on scheduler
+	// Always anchor paths to the current user's home — prevents inheriting
+	// another user's paths from a copied config.
 	homeDir, _ := os.UserHomeDir()
+	if cfg.RootDir == "" || !strings.HasPrefix(cfg.RootDir, homeDir) {
+		cfg.RootDir = homeDir
+	}
+	if cfg.CacheDir == "" || !strings.HasPrefix(cfg.CacheDir, homeDir) {
+		cfg.CacheDir = homeDir + "/tmp/cx-cache"
+	}
 	defaultLogDir := cfg.LogDir
-	if defaultLogDir == "" {
+	if defaultLogDir == "" || !strings.HasPrefix(defaultLogDir, homeDir) {
 		if cfg.SchedulerType == "condor" {
 			defaultLogDir = homeDir + "/condor/cx"
 		} else {
 			defaultLogDir = homeDir + "/slurm/cx"
 		}
-	}
-	if cfg.RootDir == "" {
-		cfg.RootDir = homeDir
-	}
-	if cfg.CacheDir == "" {
-		cfg.CacheDir = homeDir + "/tmp/cx-cache"
 	}
 
 	cfg.RootDir = prompt(reader,
@@ -1177,6 +1216,7 @@ func runStart() {
 			fmt.Println()
 			fmt.Printf("  %s▸%s Already running on %s%s:%d%s %s#%s%s\n", ansiCyan, ansiReset, ansiBold, st.Host, cfg.Port, ansiReset, ansiDim, st.ClusterID, ansiReset)
 			if !isOnCluster() {
+				killTunnel(cfg.Port)
 				fmt.Printf("  %s▸%s SSH tunnel...", ansiCyan, ansiReset)
 				tunnelCmd := exec.Command("ssh", "-fNL",
 					fmt.Sprintf("%d:%s:%d", cfg.Port, st.Host, cfg.Port),
@@ -1186,7 +1226,7 @@ func runStart() {
 					printConnect(cfg, st)
 				} else {
 					fmt.Printf(" %s✓%s\n\n", ansiGreen, ansiReset)
-					fmt.Printf("  %s%s✓ Ready — http://localhost:%d%s\n\n", ansiBold, ansiGreen, cfg.Port, ansiReset)
+					fmt.Printf("  %s%s✓ Ready — http://localhost:%d?token=%s%s\n\n", ansiBold, ansiGreen, cfg.Port, st.Token, ansiReset)
 				}
 			} else {
 				printConnect(cfg, st)
@@ -1203,6 +1243,7 @@ func runStart() {
 	exe, _ := os.Executable()
 	exeAbs, _ := filepath.Abs(exe)
 	clusterExe := cfg.mapPath(exeAbs)
+	tok := generateToken()
 	args := []string{
 		"server",
 		"--root", cfg.mapPath(cfg.RootDir),
@@ -1210,6 +1251,7 @@ func runStart() {
 		"--port", strconv.Itoa(cfg.Port),
 		"--host", "0.0.0.0",
 		"--thumb-size", strconv.Itoa(cfg.ThumbSize),
+		"--token", tok,
 	}
 
 	fmt.Println()
@@ -1229,12 +1271,13 @@ func runStart() {
 	}
 	fmt.Printf(" %s✓%s %s%s:%d%s\n", ansiGreen, ansiReset, ansiBold, workerHost, cfg.Port, ansiReset)
 
-	st := State{ClusterID: jobID, Host: workerHost}
+	st := State{ClusterID: jobID, Host: workerHost, Token: tok}
 	saveState(st)
 	cleanupSSH(cfg)
 
 	// Auto-start SSH tunnel if running from workstation
 	if !isOnCluster() {
+		killTunnel(cfg.Port)
 		fmt.Printf("  %s▸%s SSH tunnel...", ansiCyan, ansiReset)
 		tunnelCmd := exec.Command("ssh", "-fNL",
 			fmt.Sprintf("%d:%s:%d", cfg.Port, workerHost, cfg.Port),
@@ -1245,7 +1288,7 @@ func runStart() {
 		} else {
 			fmt.Printf(" %s✓%s\n", ansiGreen, ansiReset)
 			fmt.Println()
-			fmt.Printf("  %s%s✓ Ready — http://localhost:%d%s\n\n", ansiBold, ansiGreen, cfg.Port, ansiReset)
+			fmt.Printf("  %s%s✓ Ready — http://localhost:%d?token=%s%s\n\n", ansiBold, ansiGreen, cfg.Port, st.Token, ansiReset)
 		}
 	} else {
 		printConnect(cfg, st)
@@ -1262,8 +1305,21 @@ func printConnect(cfg Config, st State) {
 	fmt.Printf("     %s%sssh -fNL %d:%s:%d %s%s\n", ansiBold, ansiGreen, cfg.Port, st.Host, cfg.Port, cfg.LoginNode, ansiReset)
 	fmt.Println()
 	fmt.Printf("  %s2.%s Open in browser:\n", ansiBold, ansiReset)
-	fmt.Printf("     %s%shttp://localhost:%d%s\n", ansiBold, ansiCyan, cfg.Port, ansiReset)
+	fmt.Printf("     %s%shttp://localhost:%d?token=%s%s\n", ansiBold, ansiCyan, cfg.Port, st.Token, ansiReset)
 	fmt.Println()
+}
+
+// killTunnel kills any SSH tunnel process listening on the given port.
+func killTunnel(port int) {
+	out, err := exec.Command("lsof", "-t", "-i", fmt.Sprintf(":%d", port)).Output()
+	if err != nil || len(out) == 0 {
+		return
+	}
+	for _, pidStr := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if pid, err := strconv.Atoi(pidStr); err == nil {
+			exec.Command("kill", strconv.Itoa(pid)).Run()
+		}
+	}
 }
 
 func runStop() {
@@ -1279,6 +1335,7 @@ func runStop() {
 	} else {
 		fmt.Printf("Removed job %s\n", st.ClusterID)
 	}
+	killTunnel(cfg.Port)
 	os.Remove(statePath())
 }
 
@@ -1309,11 +1366,16 @@ func runServer() {
 	host := fs.String("host", "0.0.0.0", "Host")
 	thumb := fs.Int("thumb-size", 256, "Thumbnail size")
 	cache := fs.String("cache-dir", "", "Cache directory")
+	token := fs.String("token", "", "Auth token (generated if empty)")
 	fs.Parse(os.Args[2:])
 
 	rootDir = *root
 	thumbSize = *thumb
 	cacheDir = *cache
+	authToken = *token
+	if authToken == "" {
+		authToken = generateToken()
+	}
 	if cacheDir == "" {
 		fmt.Fprintln(os.Stderr, "Error: --cache-dir is required")
 		os.Exit(1)
@@ -1373,11 +1435,11 @@ func runServer() {
 
 	hostname, _ := os.Hostname()
 	addr := fmt.Sprintf("%s:%d", *host, *port)
-	log.Printf("Serving %s at http://%s:%d", rootDir, hostname, *port)
+	log.Printf("Serving %s at http://%s:%d?token=%s", rootDir, hostname, *port, authToken)
 
 	server := &http.Server{
 		Addr:         addr,
-		Handler:      mux,
+		Handler:      authMiddleware(mux),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 120 * time.Second,
 		IdleTimeout:  120 * time.Second,
@@ -1999,10 +2061,10 @@ select.ctrl-select:focus{outline:none;border-color:var(--accent)}
 
 <script>
 (function(){
-  var u=new URL(window.location);
-  if(!u.searchParams.has('sort')){
+  var p=new URLSearchParams(window.location.search);
+  if(!p.has('sort')){
     var s=localStorage.getItem('cx-sort');
-    if(s){u.searchParams.set('sort',s);window.location.replace(u);return;}
+    if(s){p.set('sort',s);window.location.replace('?'+p.toString());return;}
   }
 })();
 const images=[];
