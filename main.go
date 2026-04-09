@@ -657,6 +657,27 @@ type JobStatus struct {
 	Host  string
 }
 
+// getJobToken extracts the --token value from a running job's arguments.
+func getJobToken(cfg Config, jobID string) string {
+	var out []byte
+	var err error
+	// Try condor_q first, then squeue
+	out, err = runCmd(cfg, "condor_q", jobID+".0", "-af", "Arguments")
+	if err != nil {
+		out, err = runCmd(cfg, "squeue", "-j", jobID, "-h", "-o", "%o")
+	}
+	if err != nil {
+		return ""
+	}
+	fields := strings.Fields(strings.TrimSpace(string(out)))
+	for i, f := range fields {
+		if f == "--token" && i+1 < len(fields) {
+			return fields[i+1]
+		}
+	}
+	return ""
+}
+
 type Scheduler interface {
 	Submit(cfg Config, exe string, args []string) (jobID string, err error)
 	PollForRunning(cfg Config, jobID string, maxWait time.Duration) (host string, err error)
@@ -709,25 +730,26 @@ queue 1
 }
 
 func (condorScheduler) PollForRunning(cfg Config, jobID string, maxWait time.Duration) (string, error) {
-	logFile := filepath.Join(cfg.LogDir, fmt.Sprintf("fb_%s.0.log", jobID))
 	deadline := time.Now().Add(maxWait)
 	for time.Now().Before(deadline) {
 		time.Sleep(2 * time.Second)
-		data, err := os.ReadFile(logFile)
+		out, err := runCmd(cfg, "condor_q", jobID+".0", "-af", "JobStatus", "RemoteHost")
 		if err != nil {
 			continue
 		}
-		for _, line := range strings.Split(string(data), "\n") {
-			if strings.Contains(line, "Job executing on host:") {
-				if idx := strings.Index(line, "alias="); idx >= 0 {
-					host := line[idx+6:]
-					if end := strings.IndexAny(host, ".&>"); end >= 0 {
-						host = host[:end]
-					}
-					if host != "" {
-						return host, nil
-					}
-				}
+		fields := strings.Fields(strings.TrimSpace(string(out)))
+		// JobStatus 2 = Running
+		if len(fields) >= 2 && fields[0] == "2" {
+			host := fields[1]
+			// Extract short hostname from slot1_7@g110.internal.cluster...
+			if idx := strings.Index(host, "@"); idx >= 0 {
+				host = host[idx+1:]
+			}
+			if dot := strings.Index(host, "."); dot >= 0 {
+				host = host[:dot]
+			}
+			if host != "" {
+				return host, nil
 			}
 		}
 	}
@@ -761,24 +783,19 @@ func (condorScheduler) Stop(cfg Config, jobID string) error {
 }
 
 func (condorScheduler) IsJobAlive(cfg Config, jobID string) (bool, string) {
-	logFile := filepath.Join(cfg.LogDir, fmt.Sprintf("fb_%s.0.log", jobID))
-	logData, _ := os.ReadFile(logFile)
-	logStr := string(logData)
-	executing := strings.Contains(logStr, "Job executing on host:")
-	terminated := strings.Contains(logStr, "Job terminated") || strings.Contains(logStr, "Job was aborted") || strings.Contains(logStr, "Job was removed")
-	if executing && !terminated {
-		// Extract host from log
-		var host string
-		for _, line := range strings.Split(logStr, "\n") {
-			if strings.Contains(line, "Job executing on host:") {
-				if idx := strings.Index(line, "alias="); idx >= 0 {
-					h := line[idx+6:]
-					if end := strings.IndexAny(h, ".&>"); end >= 0 {
-						h = h[:end]
-					}
-					host = h
-				}
-			}
+	out, err := runCmd(cfg, "condor_q", jobID+".0", "-af", "JobStatus", "RemoteHost")
+	if err != nil {
+		return false, ""
+	}
+	fields := strings.Fields(strings.TrimSpace(string(out)))
+	// JobStatus 2 = Running
+	if len(fields) >= 2 && fields[0] == "2" {
+		host := fields[1]
+		if idx := strings.Index(host, "@"); idx >= 0 {
+			host = host[idx+1:]
+		}
+		if dot := strings.Index(host, "."); dot >= 0 {
+			host = host[:dot]
 		}
 		return true, host
 	}
@@ -1212,7 +1229,16 @@ func runStart() {
 
 	// Check if already running
 	if st, ok := loadState(); ok {
-		if alive, _ := sched.IsJobAlive(cfg, st.ClusterID); alive {
+		if alive, host := sched.IsJobAlive(cfg, st.ClusterID); alive {
+			// Refresh host from scheduler in case it changed
+			if host != "" {
+				st.Host = host
+			}
+			// Refresh token from the running job's arguments
+			if tok := getJobToken(cfg, st.ClusterID); tok != "" {
+				st.Token = tok
+			}
+			saveState(st)
 			fmt.Println()
 			fmt.Printf("  %s▸%s Already running on %s%s:%d%s %s#%s%s\n", ansiCyan, ansiReset, ansiBold, st.Host, cfg.Port, ansiReset, ansiDim, st.ClusterID, ansiReset)
 			if !isOnCluster() {
