@@ -436,15 +436,31 @@ func handleRaw(w http.ResponseWriter, r *http.Request) {
 
 const pageSize = 100
 
-// dirCache caches sorted file listings per directory+sort key.
+// dirCache caches file listings per directory+sort key. `sorted` is false
+// while a cache miss is being served in ReadDir order; a background goroutine
+// then stats + sorts and replaces the entry. This lets the first page return
+// instantly on CIFS without waiting for per-file stats.
 type dirCacheEntry struct {
 	images []Entry
 	videos []Entry
 	files  []Entry
+	sorted bool
 	time   time.Time
 }
 
-var dirCache sync.Map // key: "path|sort" -> *dirCacheEntry
+var dirCache sync.Map     // key: "path|sort" -> *dirCacheEntry
+var sortInFlight sync.Map // key: "path|sort" -> struct{}
+
+func sortEntries(s []Entry, sortBy string) {
+	switch sortBy {
+	case "date":
+		sort.Slice(s, func(i, j int) bool { return s[i].Mtime > s[j].Mtime })
+	case "size":
+		sort.Slice(s, func(i, j int) bool { return s[i].RawSize > s[j].RawSize })
+	default:
+		sort.Slice(s, func(i, j int) bool { return strings.ToLower(s[i].Name) < strings.ToLower(s[j].Name) })
+	}
+}
 
 func getDirEntries(full, subpath, sortBy string) (images, videos, files []Entry) {
 	cacheKey := full + "|" + sortBy
@@ -456,7 +472,6 @@ func getDirEntries(full, subpath, sortBy string) (images, videos, files []Entry)
 	}
 
 	entries, _ := os.ReadDir(full)
-	needStat := sortBy == "date" || sortBy == "size"
 
 	for _, e := range entries {
 		name := e.Name()
@@ -468,15 +483,7 @@ func getDirEntries(full, subpath, sortBy string) (images, videos, files []Entry)
 		if subpath != "" {
 			rel = strings.TrimRight(subpath, "/") + "/" + name
 		}
-		var size int64
-		var mtime int64
-		if needStat {
-			if info, err := e.Info(); err == nil {
-				size = info.Size()
-				mtime = info.ModTime().Unix()
-			}
-		}
-		entry := Entry{Name: name, Path: rel, Size: humanSize(size), RawSize: size, Mtime: mtime}
+		entry := Entry{Name: name, Path: rel}
 
 		if imageExts[ext] {
 			images = append(images, entry)
@@ -487,22 +494,44 @@ func getDirEntries(full, subpath, sortBy string) (images, videos, files []Entry)
 		}
 	}
 
-	sortSlice := func(s []Entry) {
-		switch sortBy {
-		case "date":
-			sort.Slice(s, func(i, j int) bool { return s[i].Mtime > s[j].Mtime })
-		case "size":
-			sort.Slice(s, func(i, j int) bool { return s[i].RawSize > s[j].RawSize })
-		default:
-			sort.Slice(s, func(i, j int) bool { return strings.ToLower(s[i].Name) < strings.ToLower(s[j].Name) })
-		}
+	// Name sort needs no stats — do it inline.
+	if sortBy == "name" || sortBy == "" {
+		sortEntries(images, "name")
+		sortEntries(videos, "name")
+		sortEntries(files, "name")
+		dirCache.Store(cacheKey, &dirCacheEntry{images, videos, files, true, time.Now()})
+		return
 	}
-	sortSlice(images)
-	sortSlice(videos)
-	sortSlice(files)
 
+	// Date/size: return ReadDir order now, stat + sort in the background.
+	dirCache.Store(cacheKey, &dirCacheEntry{images, videos, files, false, time.Now()})
 
-	dirCache.Store(cacheKey, &dirCacheEntry{images, videos, files, time.Now()})
+	if _, running := sortInFlight.LoadOrStore(cacheKey, struct{}{}); !running {
+		imgsCopy := append([]Entry(nil), images...)
+		vidsCopy := append([]Entry(nil), videos...)
+		flsCopy := append([]Entry(nil), files...)
+		go func() {
+			defer sortInFlight.Delete(cacheKey)
+			statAll := func(s []Entry) {
+				for i := range s {
+					p := filepath.Join(full, s[i].Name)
+					if info, err := os.Stat(p); err == nil {
+						s[i].RawSize = info.Size()
+						s[i].Size = humanSize(info.Size())
+						s[i].Mtime = info.ModTime().Unix()
+					}
+				}
+			}
+			statAll(imgsCopy)
+			statAll(vidsCopy)
+			statAll(flsCopy)
+			sortEntries(imgsCopy, sortBy)
+			sortEntries(vidsCopy, sortBy)
+			sortEntries(flsCopy, sortBy)
+			dirCache.Store(cacheKey, &dirCacheEntry{imgsCopy, vidsCopy, flsCopy, true, time.Now()})
+		}()
+	}
+
 	return
 }
 
